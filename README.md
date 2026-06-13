@@ -5,17 +5,25 @@ This project is a simple implementation of a gender and age prediction model bas
 It uses a convolutional neural network (CNN) to classify the gender and predict the age of a person based on their features.
 
 ## How to set up the environment
-### Create and update
-- conda env create -f environment.yml
-- conda env update --file environment.yml --prune
-### How to activate and deactivate
-To activate this environment, use
 
-      conda activate mlp
-To deactivate an active environment, use                                                                                                                                                                                                                                                                           
+The project uses `uv` for dependency management. Install dependencies and activate:
 
-      conda deactivate
-After this don't forget to select Conda mpl as interpreter!
+```bash
+uv sync
+source .venv/bin/activate
+```
+
+Or run commands directly with `uv`:
+
+```bash
+uv run python script.py
+```
+
+Register `.venv` as a Jupyter kernel (optional):
+
+```bash
+.venv/bin/python -m ipykernel install --user --name=uv --display-name "Python (uv)"
+```
 
 ## Project setup
 

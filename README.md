@@ -28,3 +28,4 @@ Register `.venv` as a Jupyter kernel (optional):
 ## Project setup
 
 ## Files
+- data/: Contains the dataset used for training and testing the model downloadable from [Kaggle](https://www.kaggle.com/datasets/alifshahariar/utkface-dataset-face-aligned-and-labeled).

@@ -1,7 +1,6 @@
 import random
 from pathlib import Path
 from typing import Any
-
 import numpy as np
 import pandas as pd
 
@@ -11,11 +10,12 @@ except Exception as exc:
     raise ImportError("TensorFlow is required. Install dependencies and run with `uv sync`.") from exc
 
 try:
-    import albumentations as A
+    import albumentations as alb
 except Exception:
-    A = None
+    alb = None
 
 from tensorflow.keras.applications.resnet50 import ResNet50, preprocess_input as resnet50_preprocess_input
+from tensorflow.keras.models import load_model
 
 
 DEFAULT_SEED = 42
@@ -53,14 +53,14 @@ def verify_images_exist(df: pd.DataFrame, images_dir: str | Path = Path("data/im
 
 
 def default_augmentations(seed: int = DEFAULT_SEED) -> Any | None:
-    if A is None:
+    if alb is None:
         return None
     random.seed(seed)
-    return A.Compose(
+    return alb.Compose(
         [
-            A.HorizontalFlip(p=0.5),
-            A.RandomBrightnessContrast(p=0.3),
-            A.ShiftScaleRotate(
+            alb.HorizontalFlip(p=0.5),
+            alb.RandomBrightnessContrast(p=0.3),
+            alb.ShiftScaleRotate(
                 shift_limit=0.05,
                 scale_limit=0.05,
                 rotate_limit=10,
@@ -248,7 +248,7 @@ def evaluate_model(model, test_ds) -> dict[str, float]:
     }
 
 
-def save_model(model, path: str | Path = Path("artifacts/multitask_model.keras")) -> Path:
+def save_model(model, path: str | Path = Path("models/multitask_model.keras")) -> Path:
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
     model.save(output)
@@ -256,7 +256,7 @@ def save_model(model, path: str | Path = Path("artifacts/multitask_model.keras")
 
 
 def test_run(
-    sample_size: int = 100,
+    sample_size: int = None,
     image_size: tuple[int, int] = (128, 128),
     batch_size: int = 16,
     epochs: int = 2,
@@ -267,6 +267,7 @@ def test_run(
     set_global_seed(seed)
 
     labels = load_labels()
+    sample_size = len(labels) if sample_size is None else sample_size
     labels = labels.sample(n=min(sample_size, len(labels)), random_state=seed).reset_index(drop=True)
     labels, missing = verify_images_exist(labels)
     if missing:
@@ -283,6 +284,7 @@ def test_run(
 
     model = build_multitask_model(input_shape=(image_size[0], image_size[1], 3))
     train_model(model, train_ds, val_ds=val_ds, epochs=epochs, seed=seed)
+    save_model(model, path=Path("models/test_multitask_model.keras"))
 
     metrics = evaluate_model(model, test_ds)
     for name, value in metrics.items():

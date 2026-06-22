@@ -1,3 +1,4 @@
+import json
 import random
 from pathlib import Path
 from typing import Any
@@ -23,13 +24,15 @@ REQUIRED_COLUMNS = {"image", "age", "gender", "race"}
 NUM_ETHNICITY_CLASSES = 5  # 0=white, 1=black, 2=asian, 3=indian, 4=others
 
 
-def set_global_seed(seed: int = DEFAULT_SEED) -> None:
+# Set global random seeds for reproducibility.
+def SetGlobalSeed(seed: int = DEFAULT_SEED) -> None:
     random.seed(seed)
     np.random.seed(seed)
     tf.random.set_seed(seed)
 
 
-def load_labels(path: str | Path = Path("data/labels.csv")) -> pd.DataFrame:
+# Load the labels CSV and validate the required columns.
+def LoadLabels(path: str | Path = Path("data/labels.csv")) -> pd.DataFrame:
     labels_path = Path(path)
     if not labels_path.exists():
         raise FileNotFoundError(f"Labels file not found: {labels_path}")
@@ -41,7 +44,8 @@ def load_labels(path: str | Path = Path("data/labels.csv")) -> pd.DataFrame:
     return df
 
 
-def verify_images_exist(df: pd.DataFrame, images_dir: str | Path = Path("data/images")) -> tuple[pd.DataFrame, list[str]]:
+# Resolve image paths and separate existing rows from missing files.
+def VerifyImagesExist(df: pd.DataFrame, images_dir: str | Path = Path("data/images")) -> tuple[pd.DataFrame, list[str]]:
     images_path = Path(images_dir)
     resolved = df.copy()
     resolved["image_path"] = resolved["image"].map(lambda name: str((images_path / str(name)).resolve()))
@@ -52,7 +56,8 @@ def verify_images_exist(df: pd.DataFrame, images_dir: str | Path = Path("data/im
     return existing_df, missing_images
 
 
-def default_augmentations(seed: int = DEFAULT_SEED) -> Any | None:
+# Build a default Albumentations augmentation pipeline when available.
+def DefaultAugmentations(seed: int = DEFAULT_SEED) -> Any | None:
     if alb is None:
         return None
     random.seed(seed)
@@ -71,7 +76,8 @@ def default_augmentations(seed: int = DEFAULT_SEED) -> Any | None:
     )
 
 
-def preprocess_image(
+# Load, resize, augment, and ResNet-preprocess a single image.
+def PreprocessImage(
     image_input: str | Path | np.ndarray,
     image_size: tuple[int, int] = (224, 224),
     training: bool = False,
@@ -93,7 +99,8 @@ def preprocess_image(
     return resnet50_preprocess_input(image.astype(np.float32))
 
 
-def create_tf_dataset(
+# Create a batched tf.data pipeline for multitask training and evaluation.
+def CreateTfDataset(
     df: pd.DataFrame,
     images_dir: str | Path = Path("data/images"),
     batch_size: int = 32,
@@ -114,21 +121,23 @@ def create_tf_dataset(
 
     ds = tf.data.Dataset.from_tensor_slices((paths, genders, ages, races))
 
-    def _load(path: tf.Tensor, gender: tf.Tensor, age: tf.Tensor, race: tf.Tensor):
+    # Load one example, optionally augment it, and package image and labels.
+    def _Load(path: tf.Tensor, gender: tf.Tensor, age: tf.Tensor, race: tf.Tensor):
         image_bytes = tf.io.read_file(path)
         image = tf.image.decode_jpeg(image_bytes, channels=3)
         image = tf.image.resize(image, image_size)
         image = tf.cast(image, tf.float32)
 
         if augment:
-            aug = augmentations or default_augmentations(seed)
+            aug = augmentations or DefaultAugmentations(seed)
 
             if aug is not None:
-                def _apply_aug(np_image: np.ndarray) -> np.ndarray:
+                # Apply Albumentations inside tf.numpy_function.
+                def _ApplyAug(np_image: np.ndarray) -> np.ndarray:
                     out = aug(image=np.clip(np_image, 0, 255).astype(np.uint8))["image"]
                     return out.astype(np.float32)
 
-                image = tf.numpy_function(_apply_aug, [image], tf.float32)
+                image = tf.numpy_function(_ApplyAug, [image], tf.float32)
                 image.set_shape((*image_size, 3))
 
         image = tf.keras.applications.resnet50.preprocess_input(image)
@@ -143,12 +152,13 @@ def create_tf_dataset(
     if shuffle:
         ds = ds.shuffle(buffer_size=len(data), seed=seed, reshuffle_each_iteration=True)
 
-    ds = ds.map(_load, num_parallel_calls=tf.data.AUTOTUNE)
+    ds = ds.map(_Load, num_parallel_calls=tf.data.AUTOTUNE)
     ds = ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
     return ds
 
 
-def build_multitask_model(
+# Build and compile the ResNet50-based multitask model.
+def BuildMultitaskModel(
     input_shape: tuple[int, int, int] = (224, 224, 3),
     learning_rate: float = 1e-3,
 ):
@@ -179,7 +189,8 @@ def build_multitask_model(
     return model
 
 
-def train_model(
+# Train the model with a fixed seed and optional validation/callbacks.
+def TrainModel(
     model,
     train_ds,
     val_ds=None,
@@ -187,7 +198,7 @@ def train_model(
     callbacks: list[Any] | None = None,
     seed: int = DEFAULT_SEED,
 ):
-    set_global_seed(seed)
+    SetGlobalSeed(seed)
     history = model.fit(
         train_ds,
         validation_data=val_ds,
@@ -198,7 +209,8 @@ def train_model(
     return history
 
 
-def evaluate_model(model, test_ds) -> dict[str, float]:
+# Evaluate gender, age, and ethnicity predictions on the test set.
+def EvaluateModel(model, test_ds) -> dict[str, float]:
     gender_true: list[np.ndarray] = []
     age_true: list[np.ndarray] = []
     ethnicity_true: list[np.ndarray] = []
@@ -248,28 +260,59 @@ def evaluate_model(model, test_ds) -> dict[str, float]:
     }
 
 
-def save_model(model, path: str | Path = Path("models/multitask_model.keras")) -> Path:
-    output = Path(path)
+# Save the trained model plus history and metrics metadata.
+def SaveModelAndMetrics(model, history, metrics, base_path: str | Path = "models/multitask_model") -> Path:
+    output = Path(base_path).with_suffix(".keras")
     output.parent.mkdir(parents=True, exist_ok=True)
     model.save(output)
+
+    history_data = history.history if hasattr(history, "history") else history
+    metadata = {
+        "history": history_data,
+        "metrics": metrics,
+    }
+    with output.with_name(output.stem + ".json").open("w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2, sort_keys=True)
+
     return output
 
 
-def test_run(
+# Load the saved model and its JSON metadata sidecar.
+def LoadModelAndMetrics(base_path: str | Path) -> Any:
+    model_path = Path(base_path).with_suffix(".keras")
+    metadata_path = model_path.with_name(model_path.stem + ".json")
+
+    if not model_path.exists():
+        raise FileNotFoundError(f"Saved model not found: {model_path}")
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"Saved metrics/history file not found: {metadata_path}")
+
+    model = load_model(model_path)
+    with metadata_path.open("r", encoding="utf-8") as f:
+        metadata = json.load(f)
+
+    history = metadata.get("history", {})
+    metrics = metadata.get("metrics", {})
+    return model, history, metrics
+
+
+# Train and save a model with metrics and history.
+def TestRun(
     sample_size: int = None,
     image_size: tuple[int, int] = (128, 128),
     batch_size: int = 16,
     epochs: int = 2,
+    save_path: str | Path = "models/multitask_model",
     seed: int = DEFAULT_SEED,
-) -> dict[str, float]:
+) -> None:
     from sklearn.model_selection import train_test_split
 
-    set_global_seed(seed)
+    SetGlobalSeed(seed)
 
-    labels = load_labels()
+    labels = LoadLabels()
     sample_size = len(labels) if sample_size is None else sample_size
     labels = labels.sample(n=min(sample_size, len(labels)), random_state=seed).reset_index(drop=True)
-    labels, missing = verify_images_exist(labels)
+    labels, missing = VerifyImagesExist(labels)
     if missing:
         print(f"Skipped {len(missing)} missing images in sample")
     if labels.empty:
@@ -278,22 +321,28 @@ def test_run(
     train_df, temp_df = train_test_split(labels, test_size=0.3, random_state=seed)
     val_df, test_df = train_test_split(temp_df, test_size=0.5, random_state=seed)
 
-    train_ds = create_tf_dataset(train_df, batch_size=batch_size, image_size=image_size, augment=True, shuffle=True, seed=seed)
-    val_ds = create_tf_dataset(val_df, batch_size=batch_size, image_size=image_size, augment=False, shuffle=False, seed=seed)
-    test_ds = create_tf_dataset(test_df, batch_size=batch_size, image_size=image_size, augment=False, shuffle=False, seed=seed)
+    train_ds = CreateTfDataset(train_df, batch_size=batch_size, image_size=image_size, augment=True, shuffle=True, seed=seed)
+    val_ds = CreateTfDataset(val_df, batch_size=batch_size, image_size=image_size, augment=False, shuffle=False, seed=seed)
+    test_ds = CreateTfDataset(test_df, batch_size=batch_size, image_size=image_size, augment=False, shuffle=False, seed=seed)
 
-    model = build_multitask_model(input_shape=(image_size[0], image_size[1], 3))
-    train_model(model, train_ds, val_ds=val_ds, epochs=epochs, seed=seed)
-    save_model(model, path=Path("models/test_multitask_model.keras"))
+    model = BuildMultitaskModel(input_shape=(image_size[0], image_size[1], 3))
+    history = TrainModel(model, train_ds, val_ds=val_ds, epochs=epochs, seed=seed)
+    metrics = EvaluateModel(model, test_ds)
+    metrics["sample_size"] = sample_size
+    metrics["image_size_x"] = image_size[0]
+    metrics["image_size_y"] = image_size[1]
+    metrics["batch_size"] = batch_size
+    metrics["epochs"] = epochs
 
-    metrics = evaluate_model(model, test_ds)
+    SaveModelAndMetrics(model, history, metrics, base_path=save_path)
+
     for name, value in metrics.items():
         print(f"{name}: {value:.4f}")
-    return metrics
 
 
 if __name__ == "__main__":
     try:
-        test_run()
+        print("Num GPUs Available: ", len(tf.config.experimental.list_physical_devices('GPU')))
+        TestRun(image_size=(128, 128), batch_size=64, epochs=25, save_path="models/gpu_v1")
     except Exception as exc:
         print("Test run failed:", exc)

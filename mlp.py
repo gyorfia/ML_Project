@@ -4,16 +4,13 @@ from pathlib import Path
 from typing import Any
 import numpy as np
 import pandas as pd
+from sklearn.metrics import confusion_matrix
+from tensorflow.python.keras.utils.version_utils import training
 
 try:
     import tensorflow as tf
 except Exception as exc:
     raise ImportError("TensorFlow is required. Install dependencies and run with `uv sync`.") from exc
-
-try:
-    import albumentations as alb
-except Exception:
-    alb = None
 
 from tensorflow.keras.applications.resnet50 import ResNet50, preprocess_input as resnet50_preprocess_input
 from tensorflow.keras.models import load_model
@@ -21,7 +18,7 @@ from tensorflow.keras.models import load_model
 
 DEFAULT_SEED = 42
 REQUIRED_COLUMNS = {"image", "age", "gender", "race"}
-NUM_ETHNICITY_CLASSES = 5  # 0=white, 1=black, 2=asian, 3=indian, 4=others
+NUM_ETHNICITY_CLASSES = 5  # 0=white, 1=black, 2=asian, 3=indian, 4=other
 
 
 # Set global random seeds for reproducibility.
@@ -55,26 +52,15 @@ def VerifyImagesExist(df: pd.DataFrame, images_dir: str | Path = Path("data/imag
     existing_df = resolved.loc[exists_mask].reset_index(drop=True)
     return existing_df, missing_images
 
-
-# Build a default Albumentations augmentation pipeline when available.
-def DefaultAugmentations(seed: int = DEFAULT_SEED) -> Any | None:
-    if alb is None:
-        return None
-    random.seed(seed)
-    return alb.Compose(
-        [
-            alb.HorizontalFlip(p=0.5),
-            alb.RandomBrightnessContrast(p=0.3),
-            alb.ShiftScaleRotate(
-                shift_limit=0.05,
-                scale_limit=0.05,
-                rotate_limit=10,
-                border_mode=0,
-                p=0.3,
-            ),
-        ]
-    )
-
+def DefaultAugmentations() -> tf.keras.Sequential:
+    return tf.keras.Sequential([
+        tf.keras.layers.RandomFlip("horizontal"),
+        tf.keras.layers.RandomBrightness(factor=0.3),
+        tf.keras.layers.RandomContrast(factor=0.3),
+        tf.keras.layers.RandomTranslation(height_factor=0.05, width_factor=0.05),
+        tf.keras.layers.RandomRotation(factor=10/360), # convert to radians
+        tf.keras.layers.RandomZoom(height_factor=(-0.05, 0.05))
+    ])
 
 # Load, resize, augment, and ResNet-preprocess a single image.
 def PreprocessImage(
@@ -108,7 +94,7 @@ def CreateTfDataset(
     augment: bool = False,
     shuffle: bool = True,
     seed: int = DEFAULT_SEED,
-    augmentations: Any | None = None,
+    augmentations: tf.keras.Sequential | None = None,
 ):
     data = df.copy()
     if "image_path" not in data.columns:
@@ -121,25 +107,20 @@ def CreateTfDataset(
 
     ds = tf.data.Dataset.from_tensor_slices((paths, genders, ages, races))
 
-    # Load one example, optionally augment it, and package image and labels.
-    def _Load(path: tf.Tensor, gender: tf.Tensor, age: tf.Tensor, race: tf.Tensor):
+    if augment:
+        aug = augmentations or DefaultAugmentations()
+
+    def _LoadAndResize(path: tf.Tensor, gender: tf.Tensor, age: tf.Tensor, race: tf.Tensor):
         image_bytes = tf.io.read_file(path)
         image = tf.image.decode_jpeg(image_bytes, channels=3)
         image = tf.image.resize(image, image_size)
         image = tf.cast(image, tf.float32)
+        return image, gender, age, race
 
+    def _AugmentAndFormat(image: tf.Tensor, gender: tf.Tensor, age: tf.Tensor, race: tf.Tensor):
         if augment:
-            aug = augmentations or DefaultAugmentations(seed)
-
-            if aug is not None:
-                # Apply Albumentations inside tf.numpy_function.
-                def _ApplyAug(np_image: np.ndarray) -> np.ndarray:
-                    out = aug(image=np.clip(np_image, 0, 255).astype(np.uint8))["image"]
-                    return out.astype(np.float32)
-
-                image = tf.numpy_function(_ApplyAug, [image], tf.float32)
-                image.set_shape((*image_size, 3))
-
+            image = aug(image, training=True)
+            image.set_shape((*image_size, 3))
         image = tf.keras.applications.resnet50.preprocess_input(image)
 
         labels = {
@@ -149,10 +130,12 @@ def CreateTfDataset(
         }
         return image, labels
 
+    ds = ds.map(_LoadAndResize, num_parallel_calls=tf.data.AUTOTUNE)
+    ds = ds.cache()
+
     if shuffle:
         ds = ds.shuffle(buffer_size=len(data), seed=seed, reshuffle_each_iteration=True)
-
-    ds = ds.map(_Load, num_parallel_calls=tf.data.AUTOTUNE)
+    ds = ds.map(_AugmentAndFormat, num_parallel_calls=tf.data.AUTOTUNE)
     ds = ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
     return ds
 
@@ -210,7 +193,7 @@ def TrainModel(
 
 
 # Evaluate gender, age, and ethnicity predictions on the test set.
-def EvaluateModel(model, test_ds) -> dict[str, float]:
+def EvaluateModel(model, test_ds) -> dict[str, Any]:
     gender_true: list[np.ndarray] = []
     age_true: list[np.ndarray] = []
     ethnicity_true: list[np.ndarray] = []
@@ -234,29 +217,24 @@ def EvaluateModel(model, test_ds) -> dict[str, float]:
         pred_age = preds[1].reshape(-1)
         pred_ethnicity = preds[2]
 
-    y_gender_hat = (pred_gender >= 0.5).astype(np.int32)
-    y_gender_int = y_gender.astype(np.int32)
+    y_gender_hat = (pred_gender >= 0.5).astype(np.int32) # prediction
+    y_gender_int = y_gender.astype(np.int32) # label
 
     accuracy = float((y_gender_hat == y_gender_int).mean())
-    tp = float(((y_gender_hat == 1) & (y_gender_int == 1)).sum())
-    fp = float(((y_gender_hat == 1) & (y_gender_int == 0)).sum())
-    fn = float(((y_gender_hat == 0) & (y_gender_int == 1)).sum())
-    precision = tp / (tp + fp) if (tp + fp) else 0.0
-    recall = tp / (tp + fn) if (tp + fn) else 0.0
-    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
 
     mae = float(np.mean(np.abs(pred_age - y_age)))
     mse = float(np.mean((pred_age - y_age) ** 2))
 
     pred_ethnicity_hat = np.argmax(pred_ethnicity, axis=1)
     ethnicity_accuracy = float((pred_ethnicity_hat == y_ethnicity).mean())
+    cm = confusion_matrix(y_ethnicity, pred_ethnicity_hat)
 
     return {
         "gender_accuracy": accuracy,
-        "gender_f1": f1,
         "age_mae": mae,
         "age_mse": mse,
         "ethnicity_accuracy": ethnicity_accuracy,
+        "confusion_matrix": cm,
     }
 
 
@@ -267,9 +245,14 @@ def SaveModelAndMetrics(model, history, metrics, base_path: str | Path = "models
     model.save(output)
 
     history_data = history.history if hasattr(history, "history") else history
+
+    metrics_data = dict(metrics)
+    if isinstance(metrics_data.get("confusion_matrix"), np.ndarray):
+        metrics_data["confusion_matrix"] = metrics_data["confusion_matrix"].tolist()
+
     metadata = {
         "history": history_data,
-        "metrics": metrics,
+        "metrics": metrics_data,
     }
     with output.with_name(output.stem + ".json").open("w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2, sort_keys=True)
@@ -278,9 +261,10 @@ def SaveModelAndMetrics(model, history, metrics, base_path: str | Path = "models
 
 
 # Load the saved model and its JSON metadata sidecar.
-def LoadModelAndMetrics(base_path: str | Path) -> Any:
+def LoadModelAndMetrics(base_path: str | Path) -> tuple[Any, dict[str, Any], dict[str, Any]]:
     model_path = Path(base_path).with_suffix(".keras")
     metadata_path = model_path.with_name(model_path.stem + ".json")
+    "return model, history, metrics"
 
     if not model_path.exists():
         raise FileNotFoundError(f"Saved model not found: {model_path}")
@@ -293,6 +277,7 @@ def LoadModelAndMetrics(base_path: str | Path) -> Any:
 
     history = metadata.get("history", {})
     metrics = metadata.get("metrics", {})
+    metrics["confusion_matrix"] = np.asarray(metrics["confusion_matrix"])
     return model, history, metrics
 
 
@@ -337,7 +322,8 @@ def TestRun(
     SaveModelAndMetrics(model, history, metrics, base_path=save_path)
 
     for name, value in metrics.items():
-        print(f"{name}: {value:.4f}")
+        if isinstance(value, (int, float)): # don't try to print cm
+            print(f"{name}: {value:.4f}")
 
 
 if __name__ == "__main__":

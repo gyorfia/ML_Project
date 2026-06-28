@@ -55,8 +55,8 @@ def VerifyImagesExist(df: pd.DataFrame, images_dir: str | Path = Path("data/imag
 def DefaultAugmentations() -> tf.keras.Sequential:
     return tf.keras.Sequential([
         tf.keras.layers.RandomFlip("horizontal"),
-        tf.keras.layers.RandomBrightness(factor=0.3),
-        tf.keras.layers.RandomContrast(factor=0.3),
+        tf.keras.layers.RandomBrightness(factor=0.1),
+        tf.keras.layers.RandomContrast(factor=0.1),
         tf.keras.layers.RandomTranslation(height_factor=0.1, width_factor=0.1),
         tf.keras.layers.RandomRotation(factor=10/360), # convert to radians
         tf.keras.layers.RandomZoom(height_factor=(-0.05, 0.05))
@@ -128,22 +128,55 @@ def BuildMultitaskModel(
 
     shared_features = base_model.output
 
-    gender_branch = tf.keras.layers.Dense(256, activation="relu", name="gender_branch_dense")(shared_features)
-    gender_branch = tf.keras.layers.Dropout(0.35, name="gender_branch_dropout")(gender_branch)
+    # --- Gender Branch ---
+    gender_branch = tf.keras.layers.Dense(512, name="gender_dense_0")(shared_features)
+    gender_branch = tf.keras.layers.BatchNormalization(name="gender_bn_0")(gender_branch)
+    gender_branch = tf.keras.layers.Activation("gelu", name="gender_act_0")(gender_branch)
+    gender_branch = tf.keras.layers.Dropout(0.4, name="gender_drop_0")(gender_branch)
+
+    gender_branch = tf.keras.layers.Dense(256, name="gender_dense_1")(gender_branch)
+    gender_branch = tf.keras.layers.BatchNormalization(name="gender_bn_1")(gender_branch)
+    gender_branch = tf.keras.layers.Activation("gelu", name="gender_act_1")(gender_branch)
+    gender_branch = tf.keras.layers.Dropout(0.4, name="gender_drop_1")(gender_branch)
+
     gender_output = tf.keras.layers.Dense(1, activation="sigmoid", name="gender")(gender_branch)
 
-    age_branch = tf.keras.layers.Dense(256, activation="relu", name="age_branch_dense")(shared_features)
-    age_branch = tf.keras.layers.Dropout(0.35, name="age_branch_dropout")(age_branch)
+    # --- Age Branch ---
+    age_branch = tf.keras.layers.Dense(512, name="age_dense_0")(shared_features)
+    age_branch = tf.keras.layers.BatchNormalization(name="age_bn_0")(age_branch)
+    age_branch = tf.keras.layers.Activation("gelu", name="age_act_0")(age_branch)
+    age_branch = tf.keras.layers.Dropout(0.3, name="age_drop_0")(age_branch)
+
+    age_branch = tf.keras.layers.Dense(256, name="age_dense_1")(age_branch)
+    age_branch = tf.keras.layers.BatchNormalization(name="age_bn_1")(age_branch)
+    age_branch = tf.keras.layers.Activation("gelu", name="age_act_1")(age_branch)
+    age_branch = tf.keras.layers.Dropout(0.3, name="age_drop_1")(age_branch)
+
+    age_branch = tf.keras.layers.Dense(128, name="age_dense_2")(age_branch)
+    age_branch = tf.keras.layers.BatchNormalization(name="age_bn_2")(age_branch)
+    age_branch = tf.keras.layers.Activation("gelu", name="age_act_2")(age_branch)
+    age_branch = tf.keras.layers.Dropout(0.2, name="age_drop_2")(age_branch)
+
     age_output = tf.keras.layers.Dense(1, activation="linear", name="age")(age_branch)
 
-    ethnicity_branch = tf.keras.layers.Dense(256, activation="relu", name="ethnicity_branch_dense")(shared_features)
-    ethnicity_branch = tf.keras.layers.Dropout(0.35, name="ethnicity_branch_dropout")(ethnicity_branch)
-    ethnicity_output = tf.keras.layers.Dense(NUM_ETHNICITY_CLASSES, activation="softmax", name="ethnicity")(ethnicity_branch)
+    # --- Ethnicity Branch ---
+    ethnicity_branch = tf.keras.layers.Dense(512, name="ethnicity_dense_0")(shared_features)
+    ethnicity_branch = tf.keras.layers.BatchNormalization(name="ethnicity_bn_0")(ethnicity_branch)
+    ethnicity_branch = tf.keras.layers.Activation("gelu", name="ethnicity_act_0")(ethnicity_branch)
+    ethnicity_branch = tf.keras.layers.Dropout(0.5, name="ethnicity_drop_0")(ethnicity_branch)
+
+    ethnicity_branch = tf.keras.layers.Dense(256, name="ethnicity_dense_1")(ethnicity_branch)
+    ethnicity_branch = tf.keras.layers.BatchNormalization(name="ethnicity_bn_1")(ethnicity_branch)
+    ethnicity_branch = tf.keras.layers.Activation("gelu", name="ethnicity_act_1")(ethnicity_branch)
+    ethnicity_branch = tf.keras.layers.Dropout(0.4, name="ethnicity_drop_1")(ethnicity_branch)
+
+    ethnicity_output = tf.keras.layers.Dense(NUM_ETHNICITY_CLASSES, activation="softmax", name="ethnicity")(
+        ethnicity_branch)
 
     model = tf.keras.Model(inputs=inputs, outputs={"gender": gender_output, "age": age_output, "ethnicity": ethnicity_output})
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
-        loss={"gender": "binary_crossentropy", "age": "mse", "ethnicity": "categorical_crossentropy"},
+        loss={"gender": "binary_crossentropy", "age": tf.keras.losses.Huber(delta=7.0), "ethnicity": "categorical_crossentropy"},
         loss_weights={"gender": 4.0, "age": 0.01, "ethnicity": 1.4},
         metrics={"gender": ["accuracy"], "age": ["mae", "mse"], "ethnicity": ["accuracy"]},
     )
@@ -285,19 +318,6 @@ def TestRun(
     train_df, temp_df = train_test_split(labels, test_size=0.3, random_state=seed)
     val_df, test_df = train_test_split(temp_df, test_size=0.5, random_state=seed)
 
-    max_class_size = train_df['race'].value_counts().max() # size of 'white' class
-    extra_rows = []
-
-    for race_label, group in train_df.groupby('race'):
-        deficit = max_class_size - len(group)
-
-        if deficit > 0:
-            # Sample ONLY the number of extra rows we need to reach the maximum
-            generated_samples = group.sample(n=deficit, replace=True, random_state=seed)
-            extra_rows.append(generated_samples)
-
-    extras_df = pd.concat(extra_rows) # oversampled dataframe
-    train_df = pd.concat([train_df, extras_df], ignore_index=True)
 
     train_ds = CreateTfDataset(train_df, batch_size=batch_size, image_size=image_size, augment=True, shuffle=True, seed=seed)
     val_ds = CreateTfDataset(val_df, batch_size=batch_size, image_size=image_size, augment=False, shuffle=False, seed=seed)
@@ -331,6 +351,6 @@ def TestRun(
 if __name__ == "__main__":
     try:
         print("Num GPUs Available: ", len(tf.config.experimental.list_physical_devices('GPU')))
-        TestRun(image_size=(200, 200), batch_size=64, learning_rate=1e-3, epochs=25, save_path="models/gpu_v2")
+        TestRun(image_size=(200, 200), batch_size=64, learning_rate=1e-3, epochs=25, save_path="models/gpu_v3")
     except Exception as exc:
         print("Test run failed:", exc)

@@ -57,33 +57,10 @@ def DefaultAugmentations() -> tf.keras.Sequential:
         tf.keras.layers.RandomFlip("horizontal"),
         tf.keras.layers.RandomBrightness(factor=0.3),
         tf.keras.layers.RandomContrast(factor=0.3),
-        tf.keras.layers.RandomTranslation(height_factor=0.05, width_factor=0.05),
+        tf.keras.layers.RandomTranslation(height_factor=0.1, width_factor=0.1),
         tf.keras.layers.RandomRotation(factor=10/360), # convert to radians
         tf.keras.layers.RandomZoom(height_factor=(-0.05, 0.05))
     ])
-
-# Load, resize, augment, and ResNet-preprocess a single image.
-def PreprocessImage(
-    image_input: str | Path | np.ndarray,
-    image_size: tuple[int, int] = (224, 224),
-    training: bool = False,
-    augmentations: Any | None = None,
-) -> np.ndarray:
-    from PIL import Image
-
-    if isinstance(image_input, (str, Path)):
-        with Image.open(image_input) as img:
-            image = np.array(img.convert("RGB"))
-    else:
-        image = np.asarray(image_input)
-
-    image = tf.image.resize(image, image_size).numpy().astype(np.float32)
-
-    if training and augmentations is not None:
-        image = augmentations(image=np.clip(image, 0, 255).astype(np.uint8))["image"].astype(np.float32)
-
-    return resnet50_preprocess_input(image.astype(np.float32))
-
 
 # Create a batched tf.data pipeline for multitask training and evaluation.
 def CreateTfDataset(
@@ -152,21 +129,22 @@ def BuildMultitaskModel(
     shared_features = base_model.output
 
     gender_branch = tf.keras.layers.Dense(256, activation="relu", name="gender_branch_dense")(shared_features)
-    gender_branch = tf.keras.layers.Dropout(0.3, name="gender_branch_dropout")(gender_branch)
+    gender_branch = tf.keras.layers.Dropout(0.35, name="gender_branch_dropout")(gender_branch)
     gender_output = tf.keras.layers.Dense(1, activation="sigmoid", name="gender")(gender_branch)
 
     age_branch = tf.keras.layers.Dense(256, activation="relu", name="age_branch_dense")(shared_features)
-    age_branch = tf.keras.layers.Dropout(0.3, name="age_branch_dropout")(age_branch)
+    age_branch = tf.keras.layers.Dropout(0.35, name="age_branch_dropout")(age_branch)
     age_output = tf.keras.layers.Dense(1, activation="linear", name="age")(age_branch)
 
     ethnicity_branch = tf.keras.layers.Dense(256, activation="relu", name="ethnicity_branch_dense")(shared_features)
-    ethnicity_branch = tf.keras.layers.Dropout(0.3, name="ethnicity_branch_dropout")(ethnicity_branch)
+    ethnicity_branch = tf.keras.layers.Dropout(0.35, name="ethnicity_branch_dropout")(ethnicity_branch)
     ethnicity_output = tf.keras.layers.Dense(NUM_ETHNICITY_CLASSES, activation="softmax", name="ethnicity")(ethnicity_branch)
 
     model = tf.keras.Model(inputs=inputs, outputs={"gender": gender_output, "age": age_output, "ethnicity": ethnicity_output})
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
         loss={"gender": "binary_crossentropy", "age": "mse", "ethnicity": "categorical_crossentropy"},
+        loss_weights={"gender": 4.0, "age": 0.01, "ethnicity": 1.4},
         metrics={"gender": ["accuracy"], "age": ["mae", "mse"], "ethnicity": ["accuracy"]},
     )
     return model
@@ -286,6 +264,7 @@ def TestRun(
     sample_size: int = None,
     image_size: tuple[int, int] = (128, 128),
     batch_size: int = 16,
+    learning_rate: float = 1e-3,
     epochs: int = 2,
     save_path: str | Path = "models/multitask_model",
     seed: int = DEFAULT_SEED,
@@ -306,12 +285,35 @@ def TestRun(
     train_df, temp_df = train_test_split(labels, test_size=0.3, random_state=seed)
     val_df, test_df = train_test_split(temp_df, test_size=0.5, random_state=seed)
 
+    max_class_size = train_df['race'].value_counts().max() # size of 'white' class
+    extra_rows = []
+
+    for race_label, group in train_df.groupby('race'):
+        deficit = max_class_size - len(group)
+
+        if deficit > 0:
+            # Sample ONLY the number of extra rows we need to reach the maximum
+            generated_samples = group.sample(n=deficit, replace=True, random_state=seed)
+            extra_rows.append(generated_samples)
+
+    extras_df = pd.concat(extra_rows) # oversampled dataframe
+    train_df = pd.concat([train_df, extras_df], ignore_index=True)
+
     train_ds = CreateTfDataset(train_df, batch_size=batch_size, image_size=image_size, augment=True, shuffle=True, seed=seed)
     val_ds = CreateTfDataset(val_df, batch_size=batch_size, image_size=image_size, augment=False, shuffle=False, seed=seed)
     test_ds = CreateTfDataset(test_df, batch_size=batch_size, image_size=image_size, augment=False, shuffle=False, seed=seed)
 
-    model = BuildMultitaskModel(input_shape=(image_size[0], image_size[1], 3))
-    history = TrainModel(model, train_ds, val_ds=val_ds, epochs=epochs, seed=seed)
+    early_stopping = tf.keras.callbacks.EarlyStopping(
+        monitor='val_loss',  # Monitor the overall validation loss
+        patience=5,  # Number of epochs with no improvement after which training will be stopped
+        min_delta=0.01,  # Minimum change in the monitored quantity to qualify as an improvement
+        restore_best_weights=True,
+        # Restores model weights from the epoch with the best value of the monitored quantity
+        verbose=1  # Prints a message when early stopping is triggered
+    )
+
+    model = BuildMultitaskModel(input_shape=(image_size[0], image_size[1], 3), learning_rate=learning_rate)
+    history = TrainModel(model, train_ds, val_ds=val_ds, epochs=epochs, callbacks=[early_stopping], seed=seed)
     metrics = EvaluateModel(model, test_ds)
     metrics["sample_size"] = sample_size
     metrics["image_size_x"] = image_size[0]
@@ -329,6 +331,6 @@ def TestRun(
 if __name__ == "__main__":
     try:
         print("Num GPUs Available: ", len(tf.config.experimental.list_physical_devices('GPU')))
-        TestRun(image_size=(128, 128), batch_size=64, epochs=25, save_path="models/gpu_v1")
+        TestRun(image_size=(200, 200), batch_size=64, learning_rate=1e-3, epochs=25, save_path="models/gpu_v2")
     except Exception as exc:
         print("Test run failed:", exc)

@@ -183,6 +183,55 @@ def BuildMultitaskModel(
     return model
 
 
+# Unfreeze only the conv5 block of the ResNet50 base for fine-tuning.
+def UnfreezeConv5Block(model) -> None:
+    # ResNet50 layers are flattened into the top-level model (not nested) when
+    # created with input_tensor=inputs, so we iterate all layers directly.
+    # Conv/BN/activation layers from ResNet50 have names like "conv1_...",
+    # "conv2_block...", etc.  Custom head layers have names like "gender_...",
+    # "age_...", "ethnicity_...".  We identify ResNet backbone layers by checking
+    # for the "conv" prefix pattern and leave custom head layers trainable.
+    RESNET_PREFIXES = ("conv1", "conv2", "conv3", "conv4", "conv5",
+                       "pool1", "bn_conv1", "input")
+
+    unfrozen_count = 0
+    frozen_count = 0
+    for layer in model.layers:
+        # Determine if this is a ResNet backbone layer.
+        is_backbone = any(layer.name.startswith(p) for p in RESNET_PREFIXES)
+
+        if not is_backbone:
+            # Custom head layers — keep trainable.
+            continue
+
+        if layer.name.startswith("conv5_block"):
+            # Keep BatchNormalization layers frozen to preserve stable running statistics.
+            if isinstance(layer, tf.keras.layers.BatchNormalization):
+                layer.trainable = False
+                frozen_count += 1
+            else:
+                layer.trainable = True
+                unfrozen_count += 1
+        else:
+            layer.trainable = False
+            frozen_count += 1
+
+    if unfrozen_count == 0:
+        raise ValueError("No conv5_block layers found — check the model architecture.")
+
+    print(f"Conv5 fine-tuning: unfroze {unfrozen_count} layers, kept {frozen_count} layers frozen.")
+
+
+# Recompile the model with a new learning rate, preserving losses and metrics.
+def RecompileModel(model, learning_rate: float) -> None:
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+        loss={"gender": "binary_crossentropy", "age": tf.keras.losses.Huber(delta=7.0), "ethnicity": "categorical_crossentropy"},
+        loss_weights={"gender": 4.0, "age": 0.01, "ethnicity": 1.4},
+        metrics={"gender": ["accuracy"], "age": ["mae", "mse"], "ethnicity": ["accuracy"]},
+    )
+
+
 # Train the model with a fixed seed and optional validation/callbacks.
 def TrainModel(
     model,
@@ -292,20 +341,25 @@ def LoadModelAndMetrics(base_path: str | Path) -> tuple[Any, dict[str, Any], dic
     return model, history, metrics
 
 
-# Train and save a model with metrics and history.
-def TestRun(
+# Two-phase transfer learning: warm-up custom heads, then fine-tune conv5 block.
+def TwoPhaseTrainingRun(
     sample_size: int = None,
-    image_size: tuple[int, int] = (128, 128),
-    batch_size: int = 16,
-    learning_rate: float = 1e-3,
-    epochs: int = 2,
-    save_path: str | Path = "models/multitask_model",
+    image_size: tuple[int, int] = (200, 200),
+    batch_size: int = 64,
+    phase1_lr: float = 1e-3,
+    phase1_epochs: int = 10,
+    phase1_patience: int = 5,
+    phase2_lr: float = 1e-5,
+    phase2_epochs: int = 30,
+    phase2_patience: int = 7,
+    save_path: str | Path = "models/gpu_v4",
     seed: int = DEFAULT_SEED,
 ) -> None:
     from sklearn.model_selection import train_test_split
 
     SetGlobalSeed(seed)
 
+    # --- Data loading and splitting ---
     labels = LoadLabels()
     sample_size = len(labels) if sample_size is None else sample_size
     labels = labels.sample(n=min(sample_size, len(labels)), random_state=seed).reset_index(drop=True)
@@ -318,39 +372,113 @@ def TestRun(
     train_df, temp_df = train_test_split(labels, test_size=0.3, random_state=seed)
     val_df, test_df = train_test_split(temp_df, test_size=0.5, random_state=seed)
 
-
     train_ds = CreateTfDataset(train_df, batch_size=batch_size, image_size=image_size, augment=True, shuffle=True, seed=seed)
     val_ds = CreateTfDataset(val_df, batch_size=batch_size, image_size=image_size, augment=False, shuffle=False, seed=seed)
     test_ds = CreateTfDataset(test_df, batch_size=batch_size, image_size=image_size, augment=False, shuffle=False, seed=seed)
 
-    early_stopping = tf.keras.callbacks.EarlyStopping(
-        monitor='val_loss',  # Monitor the overall validation loss
-        patience=5,  # Number of epochs with no improvement after which training will be stopped
-        min_delta=0.01,  # Minimum change in the monitored quantity to qualify as an improvement
+    # ========== PHASE 1: Warm-Up (Frozen Base) ==========
+    print("\n" + "=" * 60)
+    print("PHASE 1: Warm-Up — Training custom heads (base frozen)")
+    print(f"  Learning rate: {phase1_lr}, Max epochs: {phase1_epochs}, Patience: {phase1_patience}")
+    print("=" * 60 + "\n")
+
+    # Build model with frozen ResNet50 base.
+    model = BuildMultitaskModel(input_shape=(image_size[0], image_size[1], 3), learning_rate=phase1_lr)
+
+    phase1_early_stopping = tf.keras.callbacks.EarlyStopping(
+        monitor="val_loss",
+        patience=phase1_patience,
+        min_delta=0.01,
         restore_best_weights=True,
-        # Restores model weights from the epoch with the best value of the monitored quantity
-        verbose=1  # Prints a message when early stopping is triggered
+        verbose=1,
     )
 
-    model = BuildMultitaskModel(input_shape=(image_size[0], image_size[1], 3), learning_rate=learning_rate)
-    history = TrainModel(model, train_ds, val_ds=val_ds, epochs=epochs, callbacks=[early_stopping], seed=seed)
+    phase1_history = TrainModel(
+        model, train_ds, val_ds=val_ds, epochs=phase1_epochs,
+        callbacks=[phase1_early_stopping], seed=seed,
+    )
+
+    phase1_metrics = EvaluateModel(model, test_ds)
+    print("\n--- Phase 1 Results ---")
+    for name, value in phase1_metrics.items():
+        if isinstance(value, (int, float)):
+            print(f"  {name}: {value:.4f}")
+
+    # ========== PHASE 2: Fine-Tuning (Conv5 Unfrozen) ==========
+    print("\n" + "=" * 60)
+    print("PHASE 2: Fine-Tuning — Unfreezing conv5 block")
+    print(f"  Learning rate: {phase2_lr}, Max epochs: {phase2_epochs}, Patience: {phase2_patience}")
+    print("=" * 60 + "\n")
+
+    # Unfreeze conv5 block and recompile with micro learning rate.
+    UnfreezeConv5Block(model)
+    RecompileModel(model, learning_rate=phase2_lr)
+
+    phase2_early_stopping = tf.keras.callbacks.EarlyStopping(
+        monitor="val_loss",
+        patience=phase2_patience,
+        min_delta=0.001,
+        restore_best_weights=True,
+        verbose=1,
+    )
+
+    phase2_history = TrainModel(
+        model, train_ds, val_ds=val_ds, epochs=phase2_epochs,
+        callbacks=[phase2_early_stopping], seed=seed,
+    )
+
+    # ========== Final Evaluation & Save ==========
     metrics = EvaluateModel(model, test_ds)
     metrics["sample_size"] = sample_size
     metrics["image_size_x"] = image_size[0]
     metrics["image_size_y"] = image_size[1]
     metrics["batch_size"] = batch_size
-    metrics["epochs"] = epochs
+    metrics["phase1_lr"] = phase1_lr
+    metrics["phase2_lr"] = phase2_lr
+    metrics["phase1_epochs_completed"] = len(phase1_history.history.get("loss", []))
+    metrics["phase2_epochs_completed"] = len(phase2_history.history.get("loss", []))
 
-    SaveModelAndMetrics(model, history, metrics, base_path=save_path)
+    # Merge histories from both phases into a single continuous record.
+    # Concatenate merge: combine Phase 1 and Phase 2 history lists.
+    combined_history_data: dict[str, list[float]] = {}
+    for key in phase1_history.history:
+        p1_vals = phase1_history.history[key]
+        p2_vals = phase2_history.history.get(key, [])
+        combined_history_data[key] = p1_vals + p2_vals
+    # Add any keys that only exist in phase 2.
+    for key in phase2_history.history:
+        if key not in combined_history_data:
+            combined_history_data[key] = phase2_history.history[key]
 
+    # Wrap in a simple namespace so SaveModelAndMetrics can access .history attribute.
+    class _CombinedHistory:
+        """Minimal wrapper to hold merged training history."""
+        def __init__(self, data: dict) -> None:
+            self.history = data
+
+    combined_history = _CombinedHistory(combined_history_data)
+
+    SaveModelAndMetrics(model, combined_history, metrics, base_path=save_path)
+
+    print("\n--- Final Results (after Phase 2) ---")
     for name, value in metrics.items():
-        if isinstance(value, (int, float)): # don't try to print cm
-            print(f"{name}: {value:.4f}")
-
+        if isinstance(value, (int, float)):
+            print(f"  {name}: {value:.4f}")
+    print(f"\nModel saved to: {save_path}")
 
 if __name__ == "__main__":
     try:
         print("Num GPUs Available: ", len(tf.config.experimental.list_physical_devices('GPU')))
-        TestRun(image_size=(200, 200), batch_size=64, learning_rate=1e-3, epochs=25, save_path="models/gpu_v3")
+        TwoPhaseTrainingRun(
+            image_size=(200, 200),
+            batch_size=64,
+            phase1_lr=1e-3,
+            phase1_epochs=10,
+            phase1_patience=5,
+            phase2_lr=1e-5,
+            phase2_epochs=30,
+            phase2_patience=7,
+            save_path="models/gpu_v4",
+        )
     except Exception as exc:
-        print("Test run failed:", exc)
+        print("Two-phase training run failed:", exc)

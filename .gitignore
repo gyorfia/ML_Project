@@ -1,0 +1,13 @@
+# --- Machine Learning Artifacts ---
+models/
+preds/
+data/
+
+# --- Environment & Local Configuration ---
+.venv/
+.idea/
+__pycache__/
+
+# --- OS specific files ---
+.DS_Store
+Thumbs.db
